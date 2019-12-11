@@ -1,197 +1,151 @@
 import path from 'path';
+
+import validateOptions from 'schema-utils';
+import log from 'webpack-log';
+
+import schema from './options.json';
 import preProcessPattern from './preProcessPattern';
 import processPattern from './processPattern';
 import {constants as coreConstants} from 'constants';
 import {chmodSync, constants} from 'fs';
+import postProcessPattern from './postProcessPattern';
 
-function CopyWebpackPlugin(patterns = [], options = {}) {
-    if (!Array.isArray(patterns)) {
-        throw new Error('[copy-webpack-plugin] patterns must be an array');
+class CopyPlugin {
+  constructor(patterns = [], options = {}) {
+    validateOptions(schema, patterns, this.constructor.name);
+
+    this.patterns = patterns;
+    this.options = options;
+  }
+
+  apply(compiler) {
+    const fileDependencies = new Set();
+    const contextDependencies = new Set();
+    const written = {};
+
+    let context;
+
+    if (!this.options.context) {
+      ({ context } = compiler.options);
+    } else if (!path.isAbsolute(this.options.context)) {
+      context = path.join(compiler.options.context, this.options.context);
+    } else {
+      ({ context } = this.options);
     }
 
-    // Defaults debug level to 'warning'
-    options.debug = options.debug || 'warning';
+    const logger = log({
+      name: 'copy-webpack-plugin',
+      level: this.options.logLevel || 'warn',
+    });
 
-    // Defaults debugging to info if only true is specified
-    if (options.debug === true) {
-        options.debug = 'info';
-    }
+    const plugin = { name: 'CopyPlugin' };
 
-    const debugLevels = ['warning', 'info', 'debug'];
-    const debugLevelIndex = debugLevels.indexOf(options.debug);
-    function log(msg, level) {
-        if (level === 0) {
-            msg = `WARNING - ${msg}`;
-        } else {
-            level = level || 1;
-        }
-        if (level <= debugLevelIndex) {
-            console.log('[copy-webpack-plugin] ' + msg); // eslint-disable-line no-console
-        }
-    }
+    compiler.hooks.emit.tapAsync(plugin, (compilation, callback) => {
+      logger.debug('starting emit');
 
-    function warning(msg) {
-        log(msg, 0);
-    }
+      const globalRef = {
+        logger,
+        compilation,
+        written,
+        fileDependencies,
+        contextDependencies,
+        context,
+        inputFileSystem: compiler.inputFileSystem,
+        output: compiler.options.output.path,
+        ignore: this.options.ignore || [],
+        copyUnmodified: this.options.copyUnmodified,
+        concurrency: this.options.concurrency,
+      };
 
-    function info(msg) {
-        log(msg, 1);
-    }
+      if (
+        globalRef.output === '/' &&
+        compiler.options.devServer &&
+        compiler.options.devServer.outputPath
+      ) {
+        globalRef.output = compiler.options.devServer.outputPath;
+      }
 
-    function debug(msg) {
-        log(msg, 2);
-    }
+      const { patterns } = this;
 
-    const apply = (compiler) => {
-        let fileDependencies;
-        let contextDependencies;
-        const written = {};
+      Promise.all(
+        patterns.map((pattern) =>
+          Promise.resolve()
+            .then(() => preProcessPattern(globalRef, pattern))
+            // Every source (from) is assumed to exist here
+            // eslint-disable-next-line no-shadow
+            .then((pattern) =>
+              processPattern(globalRef, pattern).then((files) => {
+                if (!files) {
+                  return Promise.resolve();
+                }
 
-        let context;
-
-        if (!options.context) {
-            context = compiler.options.context;
-        } else if (!path.isAbsolute(options.context)) {
-            context = path.join(compiler.options.context, options.context);
-        } else {
-            context = options.context;
-        }
-
-        const emit = (compilation, cb) => {
-            debug('starting emit');
-            const callback = () => {
-                debug('finishing emit');
-                cb();
-            };
-
-            fileDependencies = [];
-            contextDependencies = [];
-
-            const globalRef = {
-                info,
-                debug,
-                warning,
-                compilation,
-                written,
-                fileDependencies,
-                contextDependencies,
-                context,
-                inputFileSystem: compiler.inputFileSystem,
-                output: compiler.options.output.path,
-                ignore: options.ignore || [],
-                copyUnmodified: options.copyUnmodified,
-                concurrency: options.concurrency
-            };
-
-            if (globalRef.output === '/' &&
-                compiler.options.devServer &&
-                compiler.options.devServer.outputPath) {
-                globalRef.output = compiler.options.devServer.outputPath;
-            }
-
-            const tasks = [];
-
-            patterns.forEach((pattern) => {
-                tasks.push(
-                    Promise.resolve()
-                    .then(() => preProcessPattern(globalRef, pattern))
-                    // Every source (from) is assumed to exist here
-                    .then((pattern) => processPattern(globalRef, pattern))
+                return Promise.all(
+                  files
+                    .filter(Boolean)
+                    .map((file) => postProcessPattern(globalRef, pattern, file))
                 );
-            });
+              })
+            )
+        )
+      )
+        .catch((error) => {
+          compilation.errors.push(error);
+        })
+        .then(() => {
+          logger.debug('finishing emit');
 
-            Promise.all(tasks)
-            .catch((err) => {
-                compilation.errors.push(err);
-            })
-            .then(() => callback());
-        };
+          callback();
+        });
+    });
 
-        const afterEmit = (compilation, cb) => {
-            debug('starting after-emit');
-            const callback = () => {
-                debug('finishing after-emit');
-                cb();
-            };
+    compiler.hooks.afterEmit.tapAsync(plugin, (compilation, callback) => {
+      logger.debug('starting after-emit');
 
-            let compilationFileDependencies;
-            let addFileDependency;
-            if (Array.isArray(compilation.fileDependencies)) {
-                compilationFileDependencies = new Set(compilation.fileDependencies);
-                addFileDependency = (file) => compilation.fileDependencies.push(file);
-            } else {
-                compilationFileDependencies = compilation.fileDependencies;
-                addFileDependency = (file) => compilation.fileDependencies.add(file);
-            }
-
-            let compilationContextDependencies;
-            let addContextDependency;
-            if (Array.isArray(compilation.contextDependencies)) {
-                compilationContextDependencies = new Set(compilation.contextDependencies);
-                addContextDependency = (file) => compilation.contextDependencies.push(file);
-            } else {
-                compilationContextDependencies = compilation.contextDependencies;
-                addContextDependency = (file) => compilation.contextDependencies.add(file);
-            }
-
-            // Add file dependencies if they're not already tracked
-            for (const file of fileDependencies) {
-                if (compilationFileDependencies.has(file)) {
-                    debug(`not adding ${file} to change tracking, because it's already tracked`);
-                } else {
-                    debug(`adding ${file} to change tracking`);
-                    addFileDependency(file);
-                }
-            }
-
-            // Add context dependencies if they're not already tracked
-            for (const context of contextDependencies) {
-                if (compilationContextDependencies.has(context)) {
-                    debug(`not adding ${context} to change tracking, because it's already tracked`);
-                } else {
-                    debug(`adding ${context} to change tracking`);
-                    addContextDependency(context);
-                }
-            }
-
-            // Copy permissions for files that requested it
-            let output = compiler.options.output.path;
-            if (output === '/' &&
-                compiler.options.devServer &&
-                compiler.options.devServer.outputPath) {
-                output = compiler.options.devServer.outputPath;
-            }
-
-            for (const key in written) {
-                let value = written[key];
-                if (value.copyPermissions) {
-                    debug(`restoring permissions to ${value.webpackTo}`);
-
-                    let constsfrom = constants || coreConstants;
-
-                    const mask = constsfrom.S_IRWXU | constsfrom.S_IRWXG | constsfrom.S_IRWXO;
-                    chmodSync(path.join(output, value.webpackTo), value.perms & mask);
-                }
-            }
-
-            callback();
-        };
-
-        if (compiler.hooks) {
-            const plugin = { name: 'CopyPlugin' };
-
-            compiler.hooks.emit.tapAsync(plugin, emit);
-            compiler.hooks.afterEmit.tapAsync(plugin, afterEmit);
-        } else {
-            compiler.plugin('emit', emit);
-            compiler.plugin('after-emit', afterEmit);
+      // Add file dependencies
+      if ('addAll' in compilation.fileDependencies) {
+        compilation.fileDependencies.addAll(fileDependencies);
+      } else {
+        for (const fileDependency of fileDependencies) {
+          compilation.fileDependencies.add(fileDependency);
         }
-    };
+      }
 
-    return {
-        apply
-    };
+      // Add context dependencies
+      if ('addAll' in compilation.contextDependencies) {
+        compilation.contextDependencies.addAll(contextDependencies);
+      } else {
+        for (const contextDependency of contextDependencies) {
+          compilation.contextDependencies.add(contextDependency);
+        }
+      }
+          // Copy permissions for files that requested it
+          let output = compiler.options.output.path;
+          if (output === '/' &&
+                  compiler.options.devServer &&
+                  compiler.options.devServer.outputPath) {
+              output = compiler.options.devServer.outputPath;
+          }
+
+          for (const key in written) {
+              let value = written[key];
+                  logger.debug(`deciding whether to restore perms on ${value.webpackTo}`);
+              if (value.webpackTo && value.copyPermissions) {
+
+                  let constsfrom = constants || coreConstants;
+
+                  const mask = constsfrom.S_IRWXU | constsfrom.S_IRWXG | constsfrom.S_IRWXO;
+                  let abspath = path.join(output, value.webpackTo);
+                  logger.debug(`restoring permissions to ${abspath}`);
+                  logger.debug(`restoring permissions to ${value.perms}`);
+                  chmodSync(path.join(output, value.webpackTo), value.perms & mask);
+              }
+          }
+
+      logger.debug('finishing after-emit');
+
+      callback();
+    });
+  }
 }
 
-CopyWebpackPlugin['default'] = CopyWebpackPlugin;
-module.exports = CopyWebpackPlugin;
+export default CopyPlugin;
